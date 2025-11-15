@@ -87,3 +87,65 @@ fprintf('   - All fields (v, w, v_bar, w_bar, p) initialized to zero.\n\n');
 % 所有算子都将存储在名为 'ops' 的结构体中。
 % -------------------------------------------------------------------------
 ops = build_spatial_operators(N, h, alpha);
+
+
+
+function ops = build_spatial_operators(N, h)
+
+fprintf('\n--- Building 1D Spatial Operators ---\n');
+
+% 创建单位矩阵和全1向量，方便后续使用
+I1 = speye(N);
+e = ones(N, 1);
+
+% --- 1. C1: Second-order accurate First Derivative Operator ---
+fprintf('Building C1 (1st derivative)... ');
+C1_main_diag = zeros(N, 1);
+C1_sub_diag = -e;
+C1_super_diag = e;
+C1 = spdiags([C1_sub_diag, C1_main_diag, C1_super_diag], -1:1, N, N);
+C1(1, 1:3) = [-3, 4, -1];
+C1(N, N-2:N) = [1, -4, 3];
+C1 = C1 / (2*h);
+ops.C1 = C1;
+fprintf('Done.\n');
+
+% --- 2. C2: Second-order accurate Second Derivative Operator ---
+fprintf('Building C2 (2nd derivative)... ');
+C2_main_diag = -2 * e;
+C2_sub_diag = e;
+C2_super_diag = e;
+C2 = spdiags([C2_sub_diag, C2_main_diag, C2_super_diag], -1:1, N, N);
+C2(1, 1:2) = [-2, 1]; C2(1,3)=0;
+C2(N, N-1:N) = [1, -2]; C2(N,N-2)=0;
+C2 = C2 / h^2;
+ops.C2 = C2;
+fprintf('Done.\n');
+
+% --- 3. C4: Compact scheme operator (1/12)[1, 10, 1] for B2, B3 ---
+fprintf('Building C4 (for B2, B3)... ');
+C4_main_diag = 10 * e;
+C4_sub_diag = e;
+C4_super_diag = e;
+C4 = spdiags([C4_sub_diag, C4_main_diag, C4_super_diag], -1:1, N, N);
+C4(1, 1:2) = [12, 0];
+C4(N, N-1:N) = [0, 12];
+C4 = C4 / 12;
+ops.C4 = C4;
+fprintf('Done.\n');
+
+% --- 4. C5: Operator (I - h^2/6 * delta_xx) for B4, B5 ---
+fprintf('Building C5 (for B4, B5)... ');
+C5_main_diag = 8 * e; % This comes from 6*I + h^2*C2
+C5_sub_diag = -e;
+C5_super_diag = -e;
+C5 = spdiags([C5_sub_diag, C5_main_diag, C5_super_diag], -1:1, N, N);
+C5(1, 1:2) = [6, 0];
+C5(N, N-1:N) = [0, 6];
+C5 = C5 / 6;
+ops.C5 = C5;
+fprintf('Done.\n');
+
+fprintf('--- 1D Operators Built Successfully ---\n');
+
+end
