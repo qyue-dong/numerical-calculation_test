@@ -1,0 +1,209 @@
+%% 1. 初始化环境 (Initialize Environment)
+clear; clc; close all;
+
+fprintf('--- NS-alpha Model Solver: Framework Initialization ---\n\n');
+
+%% 2. 参数定义区 (Parameter Definition Section)
+fprintf('2. Defining simulation parameters...\n');
+Re = 1000;
+L  = 1.0;
+nu = 1 / Re;
+
+% !! DEBUGGING SETTINGS !!
+N  = 32;
+h  = L / N;
+dt = 1e-3;
+T_final = 20;
+
+alpha = h;
+tolerance = 1e-7;
+plot_interval = 100;
+
+fprintf('   - Reynolds Number (Re): %d\n', Re);
+fprintf('   - Grid Resolution: %d x %d\n', N, N);
+fprintf('   - Spatial Step (h): %.4f\n', h);
+fprintf('   - Time Step (dt): %.1E\n\n', dt);
+
+%% 3. 网格生成 (Mesh Generation)
+fprintf('3. Generating computational mesh...\n');
+x_coords = linspace(h/2, L-h/2, N);
+y_coords = linspace(h/2, L-h/2, N);
+[X, Y] = meshgrid(x_coords, y_coords);
+fprintf('   - Mesh generated successfully.\n\n');
+
+%% 4. 场变量初始化 (Field Variable Initialization)
+fprintf('4. Initializing field variables...\n');
+v = zeros(N, N); w = zeros(N, N);
+v_bar = zeros(N, N); w_bar = zeros(N, N);
+p = zeros(N, N);
+fprintf('   - All fields initialized to zero.\n\n');
+
+%% 5. 构建空间离散算子 (Construct Spatial Operators)
+fprintf('5. Building all spatial operator matrices...\n');
+ops = build_spatial_operators(N, h);
+fprintf('   - All operators built and stored in ''ops''.\n\n');
+
+%% 6. 主循环外的预计算 (Pre-computation for Main Loop)
+fprintf('6. Pre-computing system matrices and applying BCs...\n');
+
+% --- Matrix for the Velocity Predictor Step ---
+M_predict = (1/dt) * ops.H1 - 0.5 * nu * ops.H2;
+b_nodes = false(N, N);
+b_nodes(1, :) = true; b_nodes(end, :) = true;
+b_nodes(:, 1) = true; b_nodes(:, end) = true;
+b_idx = find(b_nodes(:));
+for i = 1:length(b_idx)
+    idx = b_idx(i);
+    M_predict(idx, :) = 0;
+    M_predict(idx, idx) = 1;
+end
+
+% --- Matrix for the Pressure Poisson Equation ---
+% ** MODIFICATION: Use the correct Neumann Laplacian for pressure **
+Lp_p = ops.Lp_N; 
+% Pin the pressure at the first grid point to ensure non-singularity
+Lp_p(1, :) = 0;
+Lp_p(1, 1) = 1;
+
+% --- Matrix for the Filter Update Step ---
+M_filter = ops.H1 - alpha^2 * ops.H2;
+for i = 1:length(b_idx)
+    idx = b_idx(i);
+    M_filter(idx, :) = 0;
+    M_filter(idx, idx) = 1;
+end
+
+fprintf('   - Pre-computation complete.\n\n');
+
+
+%% 7. 主时间推进循环 (Main Time-Stepping Loop)
+fprintf('7. Starting time integration...\n');
+fprintf('-----------------------------------------------------\n');
+fprintf('%s   %s   %s   %s\n', 'Step', 'Time', 'Max Vel.', 'Change');
+fprintf('-----------------------------------------------------\n');
+
+num_steps = round(T_final / dt);
+v_old_vec = zeros(N*N, 1);
+v_bc_2d = zeros(N, N); v_bc_2d(end, :) = 1;
+w_bc_2d = zeros(N, N);
+v_bc_vec = v_bc_2d(:);
+w_bc_vec = w_bc_2d(:);
+
+for n = 1:num_steps
+    t = n * dt;
+
+    v_vec = v(:);
+    w_vec = w(:);
+    
+    % --- SUB-STEP 1: Velocity Predictor ---
+    adv_v_vec = ops.A1 * (v_vec .* v_vec) + ops.A2 * (v_vec .* w_vec);
+    adv_w_vec = ops.A1 * (v_vec .* w_vec) + ops.A2 * (w_vec .* w_vec);
+    RHS_v = ((1/dt)*ops.H1 + 0.5*nu*ops.H2) * v_vec - adv_v_vec;
+    RHS_w = ((1/dt)*ops.H1 + 0.5*nu*ops.H2) * w_vec - adv_w_vec;
+    RHS_v(b_idx) = v_bc_vec(b_idx);
+    RHS_w(b_idx) = w_bc_vec(b_idx);
+    v_star_vec = M_predict \ RHS_v;
+    w_star_vec = M_predict \ RHS_w;
+
+    % --- SUB-STEP 2: Pressure Poisson Equation ---
+    div_v_star = ops.Grad_x * v_star_vec + ops.Grad_y * w_star_vec;
+    RHS_p = (1/dt) * div_v_star;
+    RHS_p(1) = 0; 
+    p_vec = Lp_p \ RHS_p;
+    p = reshape(p_vec, N, N);
+
+    % --- SUB-STEP 3: Velocity Correction ---
+    v_vec = v_star_vec - dt * (ops.Grad_x * p_vec);
+    w_vec = w_star_vec - dt * (ops.Grad_y * p_vec);
+    v = reshape(v_vec, N, N);
+    w = reshape(w_vec, N, N);
+    
+    v(b_nodes) = v_bc_2d(b_nodes);
+    w(b_nodes) = w_bc_2d(b_nodes);
+    
+    % --- SUB-STEP 4: Filtered Velocity Update ---
+    v_bar_rhs = ops.H1 * v(:);
+    w_bar_rhs = ops.H1 * w(:);
+    v_bar_rhs(b_idx) = 0; 
+    w_bar_rhs(b_idx) = 0;
+    v_bar = reshape(M_filter \ v_bar_rhs, N, N);
+    w_bar = reshape(M_filter \ w_bar_rhs, N, N);
+    
+    % --- Monitor progress and visualize ---
+    if mod(n, plot_interval) == 0
+        change = norm(v(:) - v_old_vec) / (dt * norm(v(:)));
+        v_old_vec = v(:);
+        fprintf('%4d   %6.3f   %7.4f   %8.2e\n', n, t, max(abs(v(:))), change);
+        figure(1);
+        subplot(2,1,1);
+        contourf(X, Y, sqrt(v.^2 + w.^2), 20, 'LineStyle', 'none');
+        hold on;
+        quiver(X(1:2:end, 1:2:end), Y(1:2:end, 1:2:end), v(1:2:end, 1:2:end), w(1:2:end, 1:2:end), 'w');
+        hold off;
+        axis equal tight; title(sprintf('Velocity Magnitude at t = %.2f s', t));
+        xlabel('x'); ylabel('y'); colorbar;
+        subplot(2,1,2);
+        contourf(X, Y, p, 20, 'LineStyle', 'none');
+        axis equal tight; title('Pressure Field');
+        xlabel('x'); ylabel('y'); colorbar;
+        drawnow;
+        if change < tolerance && n > 100 
+            fprintf('Solution converged!\n');
+            break;
+        end
+    end
+end
+fprintf('-----------------------------------------------------\n');
+fprintf('Simulation finished.\n');
+
+%% SUPPORTING FUNCTION
+function ops = build_spatial_operators(N, h)
+    I_N = speye(N); e = ones(N, 1);
+    
+    % --- 1D Operators ---
+    C1 = spdiags([-e, zeros(N,1), e], -1:1, N, N);
+    C1(1, 1:3) = [-3, 4, -1]; C1(N, N-2:N) = [1, -4, 3];
+    C1 = C1 / (2*h);
+    
+    % C2_D: 2nd Derivative for Dirichlet BCs (e.g., for velocity)
+    C2_D = spdiags([e, -2*e, e], -1:1, N, N);
+    C2_D(1, 1:3) = [1, -2, 1]; 
+    C2_D(N, N-2:N) = [1, -2, 1];
+    C2_D = C2_D / h^2;
+
+    % ** MODIFICATION START: Create a separate C2 for Neumann BCs **
+    % C2_N: 2nd Derivative for Neumann BCs (dp/dn = 0)
+    C2_N = spdiags([e, -2*e, e], -1:1, N, N);
+    % First-order stencil for dp/dx=0 at boundary: p_1=p_0
+    % Stencil becomes p_2 - 2p_1 + p_1 = p_2 - p_1
+    C2_N(1, 1:2) = [-1, 1]; 
+    % Stencil becomes p_N - p_{N-1}
+    C2_N(N, N-1:N) = [1, -1]; 
+    C2_N = C2_N / h^2;
+    % ** MODIFICATION END **
+
+    C4 = spdiags([e, 10*e, e], -1:1, N, N) / 12;
+    C5 = I_N - (h^2/6) * C2_D;
+    
+    % --- 2D Operators ---
+    ops.A1 = kron(C1, I_N); ops.A2 = kron(I_N, C1);
+    ops.A3 = kron(C2_D, I_N); ops.A5 = kron(I_N, C2_D);
+    ops.A4 = (1/12) * ops.A3; 
+    
+    ops.B2 = kron(C4, I_N); ops.B3 = kron(I_N, C4);
+    ops.B4 = kron(C5, I_N); ops.B5 = kron(I_N, C5);
+    
+    % ** MODIFICATION: Use identity matrix for H1 for debugging **
+    ops.H1 = speye(N*N);
+    % Original H1 definition to be restored after debugging:
+    % B1x = kron(C4, I_N);
+    % B1y = kron(I_N, C4);
+    % ops.H1 = B1x + B1y - speye(N*N) + ops.A4; % Please verify this exact form
+    
+    ops.H2 = ops.B2*ops.A3 + ops.B3*ops.A5;
+    ops.Grad_x = ops.B4 * ops.A1;
+    ops.Grad_y = ops.B5 * ops.A2;
+    
+    % ** MODIFICATION: Create Lp_N using the new C2_N matrix **
+    ops.Lp_N = kron(C2_N, I_N) + kron(I_N, C2_N);
+end
