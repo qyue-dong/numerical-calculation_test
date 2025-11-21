@@ -1,151 +1,181 @@
 %% 1. 初始化环境 (Initialize Environment)
-clear;         % 清除工作区中的所有变量
-clc;           % 清理命令窗口
-close all;     % 关闭所有图形窗口
+clear; clc; close all;
 
-fprintf('--- NS-alpha Model Solver: Framework Initialization ---\n');
-fprintf('Stage: Day 1 (Morning) - Setting up the simulation environment.\n\n');
-
+fprintf('--- NS-alpha Model Solver: Framework Initialization ---\n\n');
 
 %% 2. 参数定义区 (Parameter Definition Section)
-% -------------------------------------------------------------------------
-% 将所有可调参数集中放置在此处，方便管理、修改和复现实验。
-% -------------------------------------------------------------------------
 fprintf('2. Defining simulation parameters...\n');
+Re = 1000;
+L  = 1.0;
+nu = 1 / Re;
 
-% --- 物理参数 (Physical Parameters) ---
-Re = 1000;          % 雷诺数 (Reynolds Number, Re)
-L  = 1.0;           % 方腔边长 (Domain Length)
-nu = 1 / Re;        % 运动粘度 (Kinematic Viscosity, ν), 根据Re自动计算
+% !! DEBUGGING SETTINGS !! (For H1 stability check)
+N  = 32;
+h  = L / N;
+dt = 1e-3;
+T_final = 20;
 
-% --- 数值参数 (Numerical Parameters) ---
-% 这是为最终生成 "参考解" 设置的参数
-N  = 256;           % 单方向的网格点数 (Number of grid points in one direction)
-h  = L / N;         % 空间步长 (Spatial step size, h), 根据N和L自动计算
-dt = 1e-5;          % 时间步长 (Time step, τ), 为参考解选择一个非常小的值
-T_final = 100;      % 模拟总时间 (Total simulation time)
+alpha = h;
+tolerance = 1e-7;
+plot_interval = 100;
 
-% --- NS-alpha 模型特定参数 (Model-Specific Parameters) ---
-alpha = h;          % 滤波半径 (Filter radius, α), ตามแผนงาน设定为与网格尺寸关联
-
-% --- 控制与求解器参数 (Control & Solver Parameters) ---
-tolerance = 1e-10;  % 稳态判定的残差容忍度 (Residual tolerance for steady-state)
-plot_interval = 5000;% 每隔多少个时间步更新一次可视化结果 (Visualization update interval)
-
-% --- 在命令窗口打印关键参数以供核对 ---
 fprintf('   - Reynolds Number (Re): %d\n', Re);
 fprintf('   - Grid Resolution: %d x %d\n', N, N);
 fprintf('   - Spatial Step (h): %.4f\n', h);
-fprintf('   - Time Step (dt): %.1E\n', dt);
-fprintf('   - Filter Radius (alpha): %.4f\n\n', alpha);
-
+fprintf('   - Time Step (dt): %.1E\n\n', dt);
 
 %% 3. 网格生成 (Mesh Generation)
-% -------------------------------------------------------------------------
-% 创建计算所需的二维笛卡尔坐标网格。
-% 我们使用单元中心网格(cell-centered grid)，即网格点位于单元的中心。
-% -------------------------------------------------------------------------
 fprintf('3. Generating computational mesh...\n');
-
-% 定义每个方向上单元中心的坐标
 x_coords = linspace(h/2, L-h/2, N);
 y_coords = linspace(h/2, L-h/2, N);
-
-% 使用 meshgrid 创建二维坐标矩阵
 [X, Y] = meshgrid(x_coords, y_coords);
-
 fprintf('   - Mesh generated successfully.\n\n');
 
-
 %% 4. 场变量初始化 (Field Variable Initialization)
-% -------------------------------------------------------------------------
-% 初始化所有需要求解的物理场变量。根据顶盖驱动方腔流的初始条件，
-% 所有场在 t=0 时刻均为零。
-% -------------------------------------------------------------------------
 fprintf('4. Initializing field variables...\n');
-
-% v: 速度场 u 的第一个分量 (x-velocity component)
-v = zeros(N, N);
-
-% w: 速度场 u 的第二个分量 (y-velocity component)
-w = zeros(N, N);
-
-% v_bar: 滤波后速度场 u_bar 的第一个分量
-v_bar = zeros(N, N);
-
-% w_bar: 滤波后速度场 u_bar 的第二个分量
-w_bar = zeros(N, N);
-
-% p: 压力场 (Pressure field)
+v = zeros(N, N); w = zeros(N, N);
+v_bar = zeros(N, N); w_bar = zeros(N, N);
 p = zeros(N, N);
-
-fprintf('   - All fields (v, w, v_bar, w_bar, p) initialized to zero.\n\n');
+fprintf('   - All fields initialized to zero.\n\n');
 
 %% 5. 构建空间离散算子 (Construct Spatial Operators)
-% -------------------------------------------------------------------------
-% 调用独立的函数来构建所有的空间算子矩阵。
-% 所有算子都将存储在名为 'ops' 的结构体中。
-% -------------------------------------------------------------------------
-ops = build_spatial_operators(N, h, alpha);
+fprintf('5. Building all spatial operator matrices...\n');
+ops = build_spatial_operators(N, h);
+fprintf('   - All operators built and stored in ''ops''.\n\n');
 
+%% 6. 主循环外的预计算 (Pre-computation for Main Loop)
+fprintf('6. Pre-computing system matrices and applying BCs...\n');
 
+M_predict = (1/dt) * ops.H1 - 0.5 * nu * ops.H2;
+b_nodes = false(N, N);
+b_nodes(1, :) = true; b_nodes(end, :) = true;
+b_nodes(:, 1) = true; b_nodes(:, end) = true;
+b_idx = find(b_nodes(:));
+for i = 1:length(b_idx)
+    idx = b_idx(i);
+    M_predict(idx, :) = 0;
+    M_predict(idx, idx) = 1;
+end
 
+Lp_p = ops.Lp_N; 
+Lp_p(1, :) = 0;
+Lp_p(1, 1) = 1;
+
+M_filter = ops.H1 - alpha^2 * ops.H2;
+for i = 1:length(b_idx)
+    idx = b_idx(i);
+    M_filter(idx, :) = 0;
+    M_filter(idx, idx) = 1;
+end
+fprintf('   - Pre-computation complete.\n\n');
+
+%% 7. 主时间推进循环 (Main Time-Stepping Loop)
+fprintf('7. Starting time integration...\n');
+fprintf('-----------------------------------------------------\n');
+fprintf('%s   %s   %s   %s\n', 'Step', 'Time', 'Max Vel.', 'Change');
+fprintf('-----------------------------------------------------\n');
+num_steps = round(T_final / dt);
+v_old_vec = zeros(N*N, 1);
+v_bc_2d = zeros(N, N); v_bc_2d(end, :) = 1;
+w_bc_2d = zeros(N, N);
+v_bc_vec = v_bc_2d(:);
+w_bc_vec = w_bc_2d(:);
+for n = 1:num_steps
+    t = n * dt;
+    v_vec = v(:); w_vec = w(:);
+    adv_v_vec = ops.A1 * (v_vec .* v_vec) + ops.A2 * (v_vec .* w_vec);
+    adv_w_vec = ops.A1 * (v_vec .* w_vec) + ops.A2 * (w_vec .* w_vec);
+    RHS_v = ((1/dt)*ops.H1 + 0.5*nu*ops.H2) * v_vec - adv_v_vec;
+    RHS_w = ((1/dt)*ops.H1 + 0.5*nu*ops.H2) * w_vec - adv_w_vec;
+    RHS_v(b_idx) = v_bc_vec(b_idx);
+    RHS_w(b_idx) = w_bc_vec(b_idx);
+    v_star_vec = M_predict \ RHS_v;
+    w_star_vec = M_predict \ RHS_w;
+    div_v_star = ops.Grad_x * v_star_vec + ops.Grad_y * w_star_vec;
+    RHS_p = (1/dt) * div_v_star;
+    RHS_p(1) = 0; 
+    p_vec = Lp_p \ RHS_p;
+    p = reshape(p_vec, N, N);
+    v_vec = v_star_vec - dt * (ops.Grad_x * p_vec);
+    w_vec = w_star_vec - dt * (ops.Grad_y * p_vec);
+    v = reshape(v_vec, N, N);
+    w = reshape(w_vec, N, N);
+    v(b_nodes) = v_bc_2d(b_nodes);
+    w(b_nodes) = w_bc_2d(b_nodes);
+    v_bar_rhs = ops.H1 * v(:);
+    w_bar_rhs = ops.H1 * w(:);
+    v_bar_rhs(b_idx) = 0; 
+    w_bar_rhs(b_idx) = 0;
+    v_bar = reshape(M_filter \ v_bar_rhs, N, N);
+    w_bar = reshape(M_filter \ w_bar_rhs, N, N);
+    if mod(n, plot_interval) == 0
+        change = norm(v(:) - v_old_vec) / (dt * norm(v(:)));
+        v_old_vec = v(:);
+        fprintf('%4d   %6.3f   %7.4f   %8.2e\n', n, t, max(abs(v(:))), change);
+        figure(1);
+        subplot(2,1,1);
+        contourf(X, Y, sqrt(v.^2 + w.^2), 20, 'LineStyle', 'none');
+        hold on;
+        quiver(X(1:2:end, 1:2:end), Y(1:2:end, 1:2:end), v(1:2:end, 1:2:end), w(1:2:end, 1:2:end), 'w');
+        hold off;
+        axis equal tight; title(sprintf('Velocity Magnitude at t = %.2f s', t));
+        xlabel('x'); ylabel('y'); colorbar;
+        subplot(2,1,2);
+        contourf(X, Y, p, 20, 'LineStyle', 'none');
+        axis equal tight; title('Pressure Field');
+        xlabel('x'); ylabel('y'); colorbar;
+        drawnow;
+        if change < tolerance && n > 100 
+            fprintf('Solution converged!\n');
+            break;
+        end
+    end
+end
+fprintf('-----------------------------------------------------\n');
+fprintf('Simulation finished.\n');
+
+%% SUPPORTING FUNCTION
 function ops = build_spatial_operators(N, h)
+    I_N = speye(N); e = ones(N, 1);
+    
+    % --- 1D Operators ---
+    C1 = spdiags([-e, zeros(N,1), e], -1:1, N, N);
+    C1(1, 1:3) = [-3, 4, -1]; C1(N, N-2:N) = [1, -4, 3];
+    C1 = C1 / (2*h);
+    
+    C2_D = spdiags([e, -2*e, e], -1:1, N, N);
+    C2_D(1, 1:3) = [1, -2, 1]; 
+    C2_D(N, N-2:N) = [1, -2, 1];
+    C2_D = C2_D / h^2;
 
-fprintf('\n--- Building 1D Spatial Operators ---\n');
+    C2_N = spdiags([e, -2*e, e], -1:1, N, N);
+    C2_N(1, 1:2) = [-1, 1]; 
+    C2_N(N, N-1:N) = [1, -1]; 
+    C2_N = C2_N / h^2;
 
-% 创建单位矩阵和全1向量，方便后续使用
-I1 = speye(N);
-e = ones(N, 1);
-
-% --- 1. C1: Second-order accurate First Derivative Operator ---
-fprintf('Building C1 (1st derivative)... ');
-C1_main_diag = zeros(N, 1);
-C1_sub_diag = -e;
-C1_super_diag = e;
-C1 = spdiags([C1_sub_diag, C1_main_diag, C1_super_diag], -1:1, N, N);
-C1(1, 1:3) = [-3, 4, -1];
-C1(N, N-2:N) = [1, -4, 3];
-C1 = C1 / (2*h);
-ops.C1 = C1;
-fprintf('Done.\n');
-
-% --- 2. C2: Second-order accurate Second Derivative Operator ---
-fprintf('Building C2 (2nd derivative)... ');
-C2_main_diag = -2 * e;
-C2_sub_diag = e;
-C2_super_diag = e;
-C2 = spdiags([C2_sub_diag, C2_main_diag, C2_super_diag], -1:1, N, N);
-C2(1, 1:2) = [-2, 1]; C2(1,3)=0;
-C2(N, N-1:N) = [1, -2]; C2(N,N-2)=0;
-C2 = C2 / h^2;
-ops.C2 = C2;
-fprintf('Done.\n');
-
-% --- 3. C4: Compact scheme operator (1/12)[1, 10, 1] for B2, B3 ---
-fprintf('Building C4 (for B2, B3)... ');
-C4_main_diag = 10 * e;
-C4_sub_diag = e;
-C4_super_diag = e;
-C4 = spdiags([C4_sub_diag, C4_main_diag, C4_super_diag], -1:1, N, N);
-C4(1, 1:2) = [12, 0];
-C4(N, N-1:N) = [0, 12];
-C4 = C4 / 12;
-ops.C4 = C4;
-fprintf('Done.\n');
-
-% --- 4. C5: Operator (I - h^2/6 * delta_xx) for B4, B5 ---
-fprintf('Building C5 (for B4, B5)... ');
-C5_main_diag = 8 * e; % This comes from 6*I + h^2*C2
-C5_sub_diag = -e;
-C5_super_diag = -e;
-C5 = spdiags([C5_sub_diag, C5_main_diag, C5_super_diag], -1:1, N, N);
-C5(1, 1:2) = [6, 0];
-C5(N, N-1:N) = [0, 6];
-C5 = C5 / 6;
-ops.C5 = C5;
-fprintf('Done.\n');
-
-fprintf('--- 1D Operators Built Successfully ---\n');
-
+    C4 = spdiags([e, 10*e, e], -1:1, N, N) / 12;
+    C5 = I_N - (h^2/6) * C2_D;
+    
+    % --- 2D Operators ---
+    ops.A1 = kron(C1, I_N); ops.A2 = kron(I_N, C1);
+    ops.A3 = kron(C2_D, I_N); ops.A5 = kron(I_N, C2_D);
+    
+    % Correct A4 definition from paper page 7
+    ops.A4 = (h^2/12) * ops.A3; 
+    
+    ops.B2 = kron(C4, I_N); ops.B3 = kron(I_N, C4);
+    ops.B4 = kron(C5, I_N); ops.B5 = kron(I_N, C5);
+    
+    % ** FINAL H1 OPERATOR - ACCURATELY DERIVED FROM PAPER PAGE 7 **
+    % B1 = (1 + h^2/12 * d_xx + h^2/12 * d_yy), which corresponds to
+    % B1_op = B2 + B3 - I
+    B1_op = ops.B2 + ops.B3 - speye(N*N);
+    
+    % H1 = B1 + A4, from equation (16) on page 7
+    ops.H1 = B1_op + ops.A4;
+    
+    ops.H2 = ops.B2*ops.A3 + ops.B3*ops.A5;
+    ops.Grad_x = ops.B4 * ops.A1;
+    ops.Grad_y = ops.B5 * ops.A2;
+    ops.Lp_N = kron(C2_N, I_N) + kron(I_N, C2_N);
 end

@@ -1,69 +1,78 @@
-function ops = build_spatial_operators(N, h, alpha)
+function ops = build_spatial_operators(N,h)
 
-fprintf('   - Building spatial operators for N=%d grid...\n', N);
+% ===== circulant tri-diagonal constructor =====
+circ = @(a,b,c,N) spdiags([c*ones(N,1), b*ones(N,1), a*ones(N,1)],[-1 0 1],N,N) ...
+                   + sparse(1,N,a) + sparse(N,1,c);
 
-%% 1. 构建基础的一维(1D)微分矩阵 (1D Primitives for Dirichlet BCs)
-I1 = speye(N);
-e  = ones(N, 1);
+I = speye(N);
 
-% --- C1: 一阶导数算子 (First Derivative Operator) ---
-% 内部使用二阶中心差分，边界使用二阶单边差分
-C1 = spdiags([-e, e], [-1, 1], N, N);
-C1(1, 1:3) = [-3, 4, -1];
-C1(N, N-2:N) = [1, -4, 3];
-C1 = C1 / (2*h);
+% ===============================
+% C1 (first derivative circulant)
+% ===============================
+C1 = circ(+1,0,-1,N);   % matches your screenshot for C1
+A1 = kron(C1, I) / (2*h);
+A2 = kron(I, C1) / (2*h);
 
-% --- C2: 二阶导数算子 (Second Derivative Operator) ---
-% 内部使用二阶中心差分，边界使用二阶单边差分
-C2 = spdiags([e, -2*e, e], [-1, 0, 1], N, N);
-% 在边界处使用二阶精度的单边差分
-C2(1, 1:4) = [2, -5, 4, -1]; 
-C2(N, N-3:N) = [-1, 4, -5, 2]; % <--- 系数[-1, 4, -5, 2]是正确的
-C2 = C2 / h^2;
+% ===============================
+% C2 (Laplacian core circulant)
+% ===============================
+C2 = circ(1,-2,1,N);
+A3 = kron(C2, I) / (h^2);
+A5 = kron(I, C2) / (h^2);
 
-% --- 【新步骤】为B算子创建一个内部版本的C2 ---
-% 这个版本的C2在边界处是0，确保B算子在边界处是单位算子
-C2_for_B = spdiags([e, -2*e, e], [-1, 0, 1], N, N);
-C2_for_B(1, :) = 0;   % 第一行全设为0
-C2_for_B(N, :) = 0;   % 最后一行全设为0
-C2_for_B = C2_for_B / h^2;
+% ===============================
+% A4 = (h^2/12)*A5  (from screenshot)
+% ===============================
+A4 = (h^2/12)*A5;
 
-% --- B_i 算子的一维构建块 ---
-% 【修正】使用 C2_for_B 来构建 B 算子
-B1_1D = I1 + (h^2/12) * C2_for_B; 
-B2_1D = (1/12) * spdiags([e, 10*e, e], [-1, 0, 1], N, N);
-B2_1D(1,1) = 1; B2_1D(1,2)=0;
-B2_1D(N,N) = 1; B2_1D(N,N-1)=0;
-B3_1D = B2_1D;
-% 【修正】使用 C2_for_B 来构建 B 算子
-B4_1D = I1 - (h^2/6) * C2_for_B;
-B5_1D = B4_1D;
+% ===============================
+% C3, C4, C5 (higher-order stencils)
+% ===============================
 
-%% 2. 使用Kronecker积构建2D算子 (Construct 2D Operators via Kronecker Product)
-% 修正: kron(A, I) -> x方向; kron(I, A) -> y方向
+% your screenshot says:
+% C3: diag = 10, offdiag = 1
+C3 = circ(1,10,1,N);
 
-% --- A_i 算子 (A_i Operators) ---
-ops.A1 = kron(C1, I1);       % A1 = d/dx
-ops.A2 = kron(I1, C1);       % A2 = d/dy
-ops.A3 = kron(C2, I1);       % A3 = d^2/dx^2
-ops.A5 = kron(I1, C2);       % A5 = d^2/dy^2
-ops.Lp = ops.A3 + ops.A5;    % 标准拉普拉斯算子
+% C4: diag = 14, offdiag = -1
+C4 = circ(-1,14,-1,N);
 
-% --- H_i 算子，用于投影法 (H_i Operators for Projection Method) ---
-ops.H1 = kron(B1_1D, B1_1D); % 质量矩阵
-ops.H2 = kron(B2_1D, I1) * ops.A3 + kron(I1, B3_1D) * ops.A5; % 粘性矩阵
+% C5: diag = 8, offdiag = -1
+C5 = circ(-1,8,-1,N);
 
-%% 3. 组合构建核心算子 (Core Combined Operators)
+% build B operators exactly as doc:
+B1 = kron(C3,I) / 12;
+B2 = kron(C4,I) / 12;
+B3 = kron(I,C4) / 12;
+B4 = kron(C5,I) / 6;
+B5 = kron(I,C5) / 6;
 
-% --- 滤波速度更新算子 (Filter Update Operator) ---
-% 修正: 'alpha' 来自函数输入
-ops.M_filter = ops.H1 - alpha^2 * ops.H2;
+% ===============================
+% H1, H2 definitions
+% ===============================
+H1 = B1 + A4;
+H2 = B2*A3 + B3*A5;
 
-% --- 压力相关的算子 (Pressure-related Operators) ---
-ops.Grad_x = kron(B4_1D, I1) * ops.A1;
-ops.Grad_y = kron(I1, B5_1D) * ops.A2;
-ops.Div = ops.Grad_x + ops.Grad_y; % 高阶散度算子
+% ===============================
+% pressure gradient / Laplacian
+% ===============================
+Grad_x = B4*A1;
+Grad_y = B5*A2;
 
-fprintf('   - All spatial operators constructed successfully.\n\n');
+% pressure Laplace (Neumann)
+Lp_N = A3 + A5;
+
+ops.A1 = A1; ops.A2 = A2;
+ops.A3 = A3; ops.A5 = A5;
+ops.A4 = A4;
+
+ops.B1 = B1; ops.B2 = B2; ops.B3 = B3;
+ops.B4 = B4; ops.B5 = B5;
+
+ops.H1 = H1; ops.H2 = H2;
+
+ops.Grad_x = Grad_x;
+ops.Grad_y = Grad_y;
+
+ops.Lp_N   = Lp_N;
 
 end
