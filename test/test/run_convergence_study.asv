@@ -1,0 +1,161 @@
+function run_convergence_study()
+
+%% NS-alpha Convergence Test (Decoupled Velocity)
+% 策略：将精确压力梯度作为源项，只求解速度场
+% 目的：避开同位网格的压力奇异性，专注于验证空间算子的 4 阶精度
+
+clear; clc; close all;
+
+%% 1. 实验参数
+Re = 100;
+nu = 1/Re;
+L = 1.0;
+T_final = 0.1; 
+
+grid_sizes = [16, 32, 64, 128]; % 可以跑到 128 了，因为计算很快
+errors_u = zeros(length(grid_sizes), 1);
+
+fprintf('============================================================\n');
+fprintf('NS-alpha MMS Test (Decoupled Velocity-Pressure)\n');
+fprintf('============================================================\n');
+
+for k = 1:length(grid_sizes)
+    N = grid_sizes(k);
+    h = L / (N-1);
+    dt = 0.1 * h^2; % 显式对流需要较小的时间步长
+    alpha = h;
+    
+    % --- 构建算子 ---
+    ops = build_spatial_operators(N, h);
+    x_1d = linspace(0, L, N);
+    [X, Y] = meshgrid(x_1d, x_1d);
+    
+    % --- 提取算子 ---
+    I = speye(N^2);
+    H1 = ops.H1;
+    H2 = ops.H2;
+    Dx = ops.A1; Dy = ops.A2;
+    
+    % --- 矩阵组装 (单变量求解) ---
+    % 动量方程: (H1/dt - 0.5*nu*H2) u = ...
+    M_LHS = H1/dt - 0.5*nu*H2;
+    M_RHS = H1/dt + 0.5*nu*H2;
+    
+    % 滤波矩阵
+    Lp_Filter = ops.A3 + ops.A5;
+    M_filter  = I - alpha^2 * Lp_Filter;
+    
+    % --- 边界处理 (Dirichlet) ---
+    bd_mask = false(N, N);
+    bd_mask(1,:) = true; bd_mask(end,:) = true;
+    bd_mask(:,1) = true; bd_mask(:,end) = true;
+    idx_bd = find(bd_mask);
+    
+    % 应用边界到矩阵
+    M_LHS_BC = apply_bc_matrix_lhs(M_LHS, idx_bd);
+    M_filter_BC = apply_bc_matrix_lhs(M_filter, idx_bd);
+    
+    % 预分解
+    dA_vel = decomposition(M_LHS_BC, 'lu');
+    dA_filter = decomposition(M_filter_BC, 'lu');
+    
+    % --- 初始化 ---
+    t = 0;
+    % 注意：这里的接收参数增加了 dp_dx, dp_dy
+    [~, ~, ~, ~, u, v, u_bar, v_bar] = mms_source_func(t, X(:), Y(:), nu, alpha);
+    
+    % --- 时间循环 ---
+    num_steps = ceil(T_final / dt);
+    fprintf('Grid %dx%d (dt=%.1e): ', N, N, dt);
+    
+    for n = 1:num_steps
+        t_curr = t;
+        t_next = t + dt;
+        
+        % 1. 计算源项 (t + 0.5dt)
+        [fx, fy, dpx, dpy, ~, ~, ~, ~] = mms_source_func(t_curr + 0.5*dt, X(:), Y(:), nu, alpha);
+        
+        % 核心修改：将源项 f 减去精确的压力梯度 dp
+        % 方程变为: u_t + ... = f - grad(p)
+        % 这样我们就不用求解 p 了！
+        Source_u = fx - dpx;
+        Source_v = fy - dpy;
+        
+        % 乘上质量矩阵 H1
+        RHS_force_u = H1 * Source_u;
+        RHS_force_v = H1 * Source_v;
+        
+        % 2. 非线性项 (显式)
+        % 既然是验证 4 阶，我们把非线性项打开，看算子是否抗得住
+        adv_u = - (u_bar .* (Dx * u) + v_bar .* (Dy * u));
+        adv_v = - (u_bar .* (Dx * v) + v_bar .* (Dy * v));
+        
+        % 3. 组装 RHS
+        rhs_u = M_RHS * u + dt*adv_u + dt*RHS_force_u;
+        rhs_v = M_RHS * v + dt*adv_v + dt*RHS_force_v;
+        
+        % 4. 强加边界值 (t_next)
+        [~, ~, ~, ~, u_next, v_next, ub_next, vb_next] = mms_source_func(t_next, X(:), Y(:), nu, alpha);
+        
+        rhs_u(idx_bd) = u_next(idx_bd);
+        rhs_v(idx_bd) = v_next(idx_bd);
+        
+        % 5. 求解速度
+        u_new = dA_vel \ rhs_u;
+        v_new = dA_vel \ rhs_v;
+        
+        % 6. 滤波步
+        rhs_ub = u_new; rhs_ub(idx_bd) = ub_next(idx_bd);
+        rhs_vb = v_new; rhs_vb(idx_bd) = vb_next(idx_bd);
+        
+        u_bar = dA_filter \ rhs_ub;
+        v_bar = dA_filter \ rhs_vb;
+        
+        % 更新
+        u = u_new; v = v_new;
+        t = t_next;
+        
+        if any(isnan(u)), error('NaN at step %d', n); end
+    end
+    
+    % --- 误差计算 ---
+    [~, ~, ~, ~, u_ex, v_ex, ~, ~] = mms_source_func(T_final, X(:), Y(:), nu, alpha);
+    
+    err_u = norm(u - u_ex) / norm(u_ex);
+    err_v = norm(v - v_ex) / norm(v_ex);
+    total_err = sqrt(err_u^2 + err_v^2);
+    
+    errors_u(k) = total_err;
+    fprintf('Done. Error = %.4e\n', total_err);
+end
+
+%% 绘图与收敛阶
+h_vals = L ./ (grid_sizes - 1);
+figure('Color','w');
+loglog(h_vals, errors_u, 'b-o', 'LineWidth', 2, 'MarkerSize', 8); hold on;
+
+% 绘制参考线
+ref_h = h_vals;
+loglog(ref_h, errors_u(1)*(ref_h/ref_h(1)).^4, 'k--', 'LineWidth', 1.5);
+loglog(ref_h, errors_u(1)*(ref_h/ref_h(1)).^3, 'r:', 'LineWidth', 1.5);
+
+legend('Our Code', '4th Order', '3rd Order');
+grid on; xlabel('h'); ylabel('L2 Relative Error');
+title(['NS-\alpha MMS (Re=' num2str(Re) ')']);
+
+rates = log2(errors_u(1:end-1)./errors_u(2:end));
+fprintf('\n--- Convergence Rates ---\n');
+for i=1:length(rates)
+    fprintf('N %d -> %d : Rate = %.2f\n', grid_sizes(i), grid_sizes(i+1), rates(i));
+end
+
+end
+
+% --- 辅助函数 ---
+function A_mod = apply_bc_matrix_lhs(A, idx_bd)
+    [n, ~] = size(A);
+    I = speye(n);
+    d = ones(n,1); d(idx_bd) = 0;
+    D = spdiags(d, 0, n, n);
+    A_mod = D * A + (I - D);
+end
